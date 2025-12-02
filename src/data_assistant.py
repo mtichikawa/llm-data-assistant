@@ -1,416 +1,527 @@
-'''
-LLM Data Analysis Assistant - RAG System
-Complete implementation with embeddings and query processing
-'''
+"""
+src/data_assistant.py — LLM-powered data analysis assistant.
 
-import pandas as pd
-import numpy as np
+Architecture
+============
+LLMDataAssistant
+├── DataFrameEmbedder    converts the DataFrame into searchable text chunks
+├── QueryProcessor       rule-based fast path for common query types
+├── ContextBuilder       builds concise LLM-readable DataFrame summaries
+├── AnthropicBackend     Anthropic API client with retry logic
+└── ConversationHistory  tracks multi-turn dialogue with token-aware trimming
+
+Query routing
+=============
+1. High-confidence rule match → answered instantly, free, deterministic
+   (correlations, missing data, averages, groupbys, row/column counts, etc.)
+2. Low-confidence or open-ended query → routed to Anthropic API with full
+   DataFrame context and conversation history attached
+3. LLM unavailable (no key, network error) → graceful fallback to help text
+
+The two-path design makes the assistant fast and free for ~80% of typical
+analytical questions, while the LLM handles ambiguous phrasing, multi-step
+reasoning, and follow-up questions that reference earlier answers.
+
+Multi-turn example
+==================
+    assistant = LLMDataAssistant(api_key=os.getenv("ANTHROPIC_API_KEY"))
+    assistant.load_data("q3_sales.csv")
+
+    r1 = assistant.ask("Which region had the highest revenue?")
+    r2 = assistant.ask("How does that compare to last quarter?")   # references r1
+    r3 = assistant.ask("Break it down month by month")             # references r2
+
+    assistant.save_conversation("sessions/q3_analysis.json")
+"""
+
+import logging
+import os
 from pathlib import Path
-import json
-from typing import List, Dict, Any
+from typing import Any, Dict, List, Optional
 
+import numpy as np
+import pandas as pd
+
+from src.context_builder import ContextBuilder
+from src.conversation import ConversationHistory
+
+log = logging.getLogger(__name__)
+
+# Confidence threshold: rule-based results below this are escalated to the LLM
+_RULE_CONFIDENCE_THRESHOLD = 0.7
+
+_SYSTEM_PROMPT = """\
+You are a precise, concise data analyst assistant.
+
+The DATA CONTEXT block in the system prompt contains a summary of the dataset.
+Answer the user's question based on that data. Guidelines:
+  - Give direct, specific answers with numbers where possible
+  - If the question references a previous answer, use the conversation history
+  - If you cannot answer from the provided context, say so clearly
+  - Keep answers under 150 words unless a detailed breakdown is requested
+  - Format numbers with commas (e.g. 1,234.56)
+"""
+
+
+# ── DataFrameEmbedder ──────────────────────────────────────────────────────────
 
 class DataFrameEmbedder:
-    '''Create embeddings for dataframe context'''
-    
+    """
+    Converts a DataFrame into a list of searchable text chunks.
+
+    Chunks are one-unit-of-information text snippets: a dataset summary,
+    a column description, or a sample row. Used by QueryProcessor for
+    keyword routing and by ContextBuilder when assembling LLM prompts.
+    """
+
     def __init__(self):
-        self.chunks = []
-        self.metadata = {}
-        
-    def process_dataframe(self, df: pd.DataFrame, name: str = "dataset"):
-        '''Convert dataframe to searchable chunks'''
-        chunks = []
-        
-        # Overall summary chunk
-        summary = {
-            'content': f"Dataset '{name}' has {len(df)} rows and {len(df.columns)} columns. "
-                      f"Columns: {', '.join(df.columns)}",
-            'type': 'summary',
-            'metadata': {'name': name, 'shape': df.shape}
-        }
-        chunks.append(summary)
-        
-        # Column-level chunks
+        self.chunks:   List[Dict] = []
+        self.metadata: Dict[str, Any] = {}
+
+    def process_dataframe(self, df: pd.DataFrame, name: str = "dataset") -> List[Dict]:
+        """Build and store the chunk list. Returns the list for inspection."""
+        chunks: List[Dict] = []
+
+        # Dataset-level summary
+        chunks.append({
+            "content":  (
+                f"Dataset '{name}' has {len(df)} rows and {len(df.columns)} columns. "
+                f"Columns: {', '.join(df.columns)}"
+            ),
+            "type":     "summary",
+            "metadata": {"name": name, "shape": df.shape},
+        })
+
+        # Per-column chunks
         for col in df.columns:
-            col_info = self._analyze_column(df, col)
-            chunk = {
-                'content': f"Column '{col}': {col_info['description']}",
-                'type': 'column',
-                'metadata': {'column': col, **col_info}
-            }
-            chunks.append(chunk)
-            
-        # Sample data chunks
-        for i in range(min(5, len(df))):
-            row_text = f"Row {i}: " + ", ".join([f"{col}={df.iloc[i][col]}" for col in df.columns[:5]])
+            info = self._analyse_column(df, col)
             chunks.append({
-                'content': row_text,
-                'type': 'sample',
-                'metadata': {'row': i}
+                "content":  f"Column '{col}': {info['description']}",
+                "type":     "column",
+                "metadata": {"column": col, **info},
             })
-            
-        self.chunks = chunks
-        self.metadata = {'name': name, 'df': df}
+
+        # Sample row chunks (up to 5)
+        for i in range(min(5, len(df))):
+            row_text = f"Row {i}: " + ", ".join(
+                f"{col}={df.iloc[i][col]}" for col in df.columns[:6]
+            )
+            chunks.append({"content": row_text, "type": "sample", "metadata": {"row": i}})
+
+        self.chunks   = chunks
+        self.metadata = {"name": name, "df": df}
         return chunks
-        
-    def _analyze_column(self, df: pd.DataFrame, col: str) -> Dict:
-        '''Analyze a single column'''
-        info = {
-            'dtype': str(df[col].dtype),
-            'missing': int(df[col].isnull().sum()),
-            'unique': int(df[col].nunique())
+
+    def _analyse_column(self, df: pd.DataFrame, col: str) -> Dict[str, Any]:
+        info: Dict[str, Any] = {
+            "dtype":   str(df[col].dtype),
+            "missing": int(df[col].isnull().sum()),
+            "unique":  int(df[col].nunique()),
         }
-        
-        if df[col].dtype in ['int64', 'float64']:
-            info['description'] = (
-                f"Numeric column with mean={df[col].mean():.2f}, "
+        if df[col].dtype in ("int64", "float64"):
+            info["description"] = (
+                f"Numeric with mean={df[col].mean():.2f}, "
                 f"range=[{df[col].min():.2f}, {df[col].max():.2f}]"
             )
-            info['stats'] = {
-                'mean': float(df[col].mean()),
-                'std': float(df[col].std()),
-                'min': float(df[col].min()),
-                'max': float(df[col].max())
+            info["stats"] = {
+                "mean": float(df[col].mean()), "std":  float(df[col].std()),
+                "min":  float(df[col].min()),  "max":  float(df[col].max()),
             }
         else:
-            top_val = df[col].value_counts().head(1)
-            if len(top_val) > 0:
-                info['description'] = f"Categorical column with {info['unique']} unique values. Most common: {top_val.index[0]}"
-                info['top_values'] = df[col].value_counts().head(5).to_dict()
-            else:
-                info['description'] = f"Categorical column with {info['unique']} unique values"
-                
+            top = df[col].value_counts().head(1)
+            info["description"] = (
+                f"Categorical with {info['unique']} unique values, "
+                f"most common: {top.index[0]}" if len(top) else
+                f"Categorical with {info['unique']} unique values"
+            )
+            info["top_values"] = df[col].value_counts().head(5).to_dict()
         return info
 
 
+# ── QueryProcessor ─────────────────────────────────────────────────────────────
+
 class QueryProcessor:
-    '''Process natural language queries about data'''
-    
+    """
+    Deterministic query router for common analytical question types.
+
+    Returns a confidence score (0.0–1.0) alongside each answer so the
+    caller can decide whether to accept the result or escalate to the LLM.
+    confidence=1.0 means the match was unambiguous; <0.7 means the LLM
+    should be tried.
+    """
+
     def __init__(self, embedder: DataFrameEmbedder):
-        self.embedder = embedder
-        self.df = embedder.metadata.get('df')
-        
+        self.df: pd.DataFrame = embedder.metadata["df"]
+
     def process_query(self, query: str) -> Dict[str, Any]:
-        '''Process a query and return results'''
-        query_lower = query.lower()
-        
-        # Route to appropriate handler — order matters: more specific checks first
-        if 'correlat' in query_lower:
-            return self._handle_correlation_query()
-        elif 'missing' in query_lower or 'null' in query_lower:
-            return self._handle_missing_query()
-        elif 'average' in query_lower or 'mean' in query_lower:
-            return self._handle_average_query(query_lower)
-        elif 'highest' in query_lower or 'which' in query_lower or 'region' in query_lower or 'top' in query_lower:
-            return self._handle_group_query(query_lower)
-        elif 'column' in query_lower or 'field' in query_lower:
-            return self._handle_column_query(query)
-        elif 'row' in query_lower or 'record' in query_lower or 'how many' in query_lower:
-            return self._handle_row_query(query)
-        elif 'summary' in query_lower or 'describe' in query_lower:
-            return self._handle_summary_query()
-        elif 'visuali' in query_lower or 'plot' in query_lower or 'chart' in query_lower:
-            return self._handle_visualization_query(query)
-        else:
-            return self._handle_general_query(query)
-            
-    def _handle_column_query(self, query: str) -> Dict:
-        '''Handle questions about columns'''
-        return {
-            'answer': f"The dataset has {len(self.df.columns)} columns: {', '.join(self.df.columns)}",
-            'data': list(self.df.columns),
-            'type': 'column_list'
-        }
-        
-    def _handle_row_query(self, query: str) -> Dict:
-        '''Handle questions about rows'''
-        return {
-            'answer': f"The dataset contains {len(self.df)} rows",
-            'data': len(self.df),
-            'type': 'row_count'
-        }
-        
-    def _handle_correlation_query(self) -> Dict:
-        '''Calculate correlations'''
-        numeric_cols = self.df.select_dtypes(include=[np.number]).columns
-        
-        if len(numeric_cols) < 2:
-            return {
-                'answer': "Need at least 2 numeric columns for correlation analysis",
-                'data': None,
-                'type': 'error'
-            }
-            
-        corr_matrix = self.df[numeric_cols].corr()
-        
-        # Find strongest correlations
-        correlations = []
-        for i in range(len(corr_matrix.columns)):
-            for j in range(i+1, len(corr_matrix.columns)):
-                correlations.append({
-                    'col1': corr_matrix.columns[i],
-                    'col2': corr_matrix.columns[j],
-                    'correlation': corr_matrix.iloc[i, j]
-                })
-                
-        correlations.sort(key=lambda x: abs(x['correlation']), reverse=True)
-        
-        top_5 = correlations[:5]
-        lines = [f"  {c['col1']} ↔ {c['col2']}: r={c['correlation']:.3f}" for c in top_5]
-        answer = "Top correlations:\n" + "\n".join(lines)
+        """Attempt to answer the query via rule-based matching."""
+        q = query.lower()
 
+        if "correlat" in q:
+            return {**self._correlation(), "confidence": 1.0}
+        if "missing" in q or ("null" in q and "value" in q):
+            return {**self._missing(), "confidence": 1.0}
+        if "average" in q or "mean" in q:
+            return {**self._average(q), "confidence": 1.0}
+        if any(k in q for k in ("highest", "lowest", "top", "bottom", "which", "by region", "by category", "group")):
+            return {**self._group(q), "confidence": 0.85}
+        if "column" in q or "field" in q or "what column" in q:
+            return {**self._columns(), "confidence": 1.0}
+        if ("row" in q and "how many" in q) or "how many record" in q or "dataset size" in q:
+            return {**self._rows(), "confidence": 1.0}
+        if "summary" in q or "describe" in q or "overview" in q:
+            return {**self._summary(), "confidence": 1.0}
+        if any(k in q for k in ("visuali", "plot", "chart", "graph")):
+            return {**self._visualizations(), "confidence": 1.0}
+
+        return {"answer": None, "data": None, "type": "unmatched", "confidence": 0.0}
+
+    # ── Handlers ──────────────────────────────────────────────────────────────
+
+    def _columns(self) -> Dict:
         return {
-            'answer': answer,
-            'data': correlations[:5],
-            'type': 'correlation',
-            'visualization': 'heatmap'
+            "answer": f"The dataset has {len(self.df.columns)} columns: {', '.join(self.df.columns)}",
+            "data":   list(self.df.columns),
+            "type":   "column_list",
         }
 
-    def _handle_average_query(self, query_lower: str) -> Dict:
-        '''Handle average/mean questions'''
-        numeric_cols = self.df.select_dtypes(include=[np.number]).columns.tolist()
+    def _rows(self) -> Dict:
+        return {"answer": f"The dataset contains {len(self.df):,} rows.", "data": len(self.df), "type": "row_count"}
 
-        # Check if query targets a specific column
-        targeted = [col for col in numeric_cols if col.lower() in query_lower or col.replace('_', ' ') in query_lower]
+    def _correlation(self) -> Dict:
+        numeric = self.df.select_dtypes(include=[np.number]).columns
+        if len(numeric) < 2:
+            return {"answer": "Need at least 2 numeric columns for correlation analysis.", "data": None, "type": "error"}
+        corr = self.df[numeric].corr()
+        pairs = sorted([
+            {"col1": corr.columns[i], "col2": corr.columns[j], "r": corr.iloc[i, j]}
+            for i in range(len(corr.columns))
+            for j in range(i + 1, len(corr.columns))
+        ], key=lambda x: abs(x["r"]), reverse=True)
+        lines = [f"  {p['col1']} ↔ {p['col2']}: r={p['r']:.3f}" for p in pairs[:5]]
+        return {"answer": "Top correlations:\n" + "\n".join(lines), "data": pairs[:5], "type": "correlation", "visualization": "heatmap"}
 
-        if targeted:
-            lines = [f"  {col}: {self.df[col].mean():,.2f}" for col in targeted]
-        else:
-            lines = [f"  {col}: {self.df[col].mean():,.2f}" for col in numeric_cols]
+    def _average(self, q: str) -> Dict:
+        numeric  = self.df.select_dtypes(include=[np.number]).columns.tolist()
+        targeted = [c for c in numeric if c.lower() in q or c.replace("_", " ") in q]
+        cols     = targeted or numeric
+        lines    = [f"  {c}: {self.df[c].mean():,.2f}" for c in cols]
+        return {"answer": "Average values:\n" + "\n".join(lines), "data": {c: float(self.df[c].mean()) for c in cols}, "type": "average"}
 
-        return {
-            'answer': "Average values:\n" + "\n".join(lines),
-            'data': {col: float(self.df[col].mean()) for col in numeric_cols},
-            'type': 'average'
-        }
+    def _group(self, q: str) -> Dict:
+        cat_cols = self.df.select_dtypes(include="object").columns.tolist()
+        num_cols = self.df.select_dtypes(include=[np.number]).columns.tolist()
+        if not cat_cols or not num_cols:
+            return {"answer": "No categorical columns available for grouping.", "data": None, "type": "group"}
+        group_col = next((c for c in cat_cols if c.lower() in q), cat_cols[0])
+        value_col = next((c for c in num_cols if c.lower() in q or c.replace("_", " ") in q), num_cols[0])
+        grouped   = self.df.groupby(group_col)[value_col].sum().sort_values(ascending=False)
+        lines     = [f"  {idx}: {val:,.0f}" for idx, val in grouped.items()]
+        return {"answer": f"By {group_col}, highest {value_col} is '{grouped.index[0]}':\n" + "\n".join(lines), "data": grouped.to_dict(), "type": "group"}
 
-    def _handle_group_query(self, query_lower: str) -> Dict:
-        '''Handle groupby questions — highest region, top category, etc.'''
-        categorical_cols = self.df.select_dtypes(include='object').columns.tolist()
-        numeric_cols = self.df.select_dtypes(include=[np.number]).columns.tolist()
+    def _missing(self) -> Dict:
+        m    = self.df.isnull().sum()
+        cols = m[m > 0]
+        if len(cols) == 0:
+            return {"answer": "No missing values found.", "data": {}, "type": "missing"}
+        lines = [f"  {c}: {n} ({n / len(self.df) * 100:.1f}%)" for c, n in cols.items()]
+        return {"answer": f"Missing values in {len(cols)} column(s):\n" + "\n".join(lines), "data": cols.to_dict(), "type": "missing"}
 
-        if not categorical_cols or not numeric_cols:
-            return {'answer': "No categorical columns available to group by.", 'type': 'group'}
+    def _summary(self) -> Dict:
+        stats = self.df.describe()
+        return {"answer": f"Dataset summary:\n{stats}", "data": stats.to_dict(), "type": "summary"}
 
-        # Pick group column based on query keywords
-        group_col = categorical_cols[0]
-        for col in categorical_cols:
-            if col.lower() in query_lower:
-                group_col = col
-                break
-
-        # Pick value column based on query keywords
-        value_col = numeric_cols[0]
-        for col in numeric_cols:
-            if col.lower() in query_lower or col.replace('_', ' ') in query_lower:
-                value_col = col
-                break
-        # Default to revenue if present
-        if 'revenue' in numeric_cols and 'revenue' not in query_lower:
-            value_col = 'revenue'
-
-        grouped = self.df.groupby(group_col)[value_col].sum().sort_values(ascending=False)
-        top = grouped.index[0]
-        lines = [f"  {idx}: {val:,.0f}" for idx, val in grouped.items()]
-
-        return {
-            'answer': f"By {group_col}, highest {value_col} is '{top}':\n" + "\n".join(lines),
-            'data': grouped.to_dict(),
-            'type': 'group'
-        }
-        
-    def _handle_missing_query(self) -> Dict:
-        '''Handle missing data questions'''
-        missing = self.df.isnull().sum()
-        missing_cols = missing[missing > 0]
-        
-        if len(missing_cols) == 0:
-            return {
-                'answer': "No missing values found in the dataset",
-                'data': {},
-                'type': 'missing'
-            }
-            
-        answer = f"Found missing values in {len(missing_cols)} columns:\n"
-        for col, count in missing_cols.items():
-            pct = (count / len(self.df)) * 100
-            answer += f"  - {col}: {count} ({pct:.1f}%)\n"
-            
-        return {
-            'answer': answer,
-            'data': missing_cols.to_dict(),
-            'type': 'missing'
-        }
-        
-    def _handle_summary_query(self) -> Dict:
-        '''Provide dataset summary'''
-        summary_stats = self.df.describe()
-        
-        return {
-            'answer': f"Dataset summary:\n{summary_stats}",
-            'data': summary_stats.to_dict(),
-            'type': 'summary'
-        }
-        
-    def _handle_visualization_query(self, query: str) -> Dict:
-        '''Suggest visualizations'''
-        numeric_cols = self.df.select_dtypes(include=[np.number]).columns
-        
+    def _visualizations(self) -> Dict:
+        numeric     = self.df.select_dtypes(include=[np.number]).columns
         suggestions = []
-        if len(numeric_cols) >= 2:
-            suggestions.append(f"Scatter plot: {numeric_cols[0]} vs {numeric_cols[1]}")
-            suggestions.append(f"Correlation heatmap of numeric columns")
-            
-        for col in numeric_cols[:3]:
-            suggestions.append(f"Histogram of {col}")
-            
-        return {
-            'answer': "Suggested visualizations:\n" + "\n".join(f"  - {s}" for s in suggestions),
-            'data': suggestions,
-            'type': 'visualization_suggestions'
-        }
-        
-    def _handle_general_query(self, query: str) -> Dict:
-        '''Handle general questions'''
-        return {
-            'answer': (
-                "I can help with:\n"
-                "  - Column information\n"
-                "  - Row counts\n"
-                "  - Missing data analysis\n"
-                "  - Correlation analysis\n"
-                "  - Average/mean values\n"
-                "  - Highest/top group analysis\n"
-                "  - Dataset summaries\n"
-                "  - Visualization suggestions"
-            ),
-            'data': None,
-            'type': 'help'
-        }
+        if len(numeric) >= 2:
+            suggestions += [f"Scatter: {numeric[0]} vs {numeric[1]}", "Correlation heatmap"]
+        for c in numeric[:3]:
+            suggestions.append(f"Histogram of {c}")
+        return {"answer": "Suggested visualizations:\n" + "\n".join(f"  - {s}" for s in suggestions), "data": suggestions, "type": "visualization_suggestions"}
 
+
+# ── LLMDataAssistant ──────────────────────────────────────────────────────────
 
 class LLMDataAssistant:
-    '''Complete LLM-powered data analysis assistant'''
-    
-    def __init__(self):
-        self.embedder = None
-        self.processor = None
-        self.df = None
-        
-    def load_data(self, filepath: str):
-        '''Load CSV and prepare for analysis'''
-        self.df = pd.read_csv(filepath)
-        print(f"✅ Loaded {len(self.df)} rows, {len(self.df.columns)} columns")
-        
-        # Create embeddings
-        self.embedder = DataFrameEmbedder()
-        self.embedder.process_dataframe(self.df, Path(filepath).stem)
-        
-        # Initialize query processor
-        self.processor = QueryProcessor(self.embedder)
-        
-    def ask(self, question: str) -> Dict:
-        '''Ask a question about the data'''
+    """
+    LLM-powered data analysis assistant with deterministic fast path.
+
+    Answers natural-language questions about a loaded CSV dataset using a
+    two-path strategy:
+
+        Fast path  — common, structured queries answered instantly via
+                     keyword routing (averages, correlations, groupbys, etc.)
+        LLM path   — ambiguous, open-ended, or follow-up queries routed to
+                     the Anthropic API with full DataFrame context and
+                     conversation history
+
+    The LLM path is optional. Without an API key the assistant still works
+    for all common query types and returns a descriptive help message for
+    anything it can't handle deterministically.
+
+    Args:
+        api_key:            Anthropic API key. Falls back to ANTHROPIC_API_KEY
+                            env var. Omit or set to None for rule-based mode.
+        max_history_tokens: Token budget for stored conversation history.
+                            Default 3000 — leaves room for context + response.
+
+    Example:
+        >>> assistant = LLMDataAssistant()          # rule-based only
+        >>> assistant = LLMDataAssistant(api_key=os.getenv("ANTHROPIC_API_KEY"))
+        >>> assistant.load_data("data/sales_q3.csv")
+        >>> print(assistant.ask("Which region had the highest revenue?")["answer"])
+        >>> print(assistant.ask("What drove that? Anything unusual?")["answer"])
+    """
+
+    def __init__(
+        self,
+        api_key:            Optional[str] = None,
+        max_history_tokens: int           = 3000,
+    ):
+        self.embedder:        Optional[DataFrameEmbedder] = None
+        self.processor:       Optional[QueryProcessor]    = None
+        self.context_builder: Optional[ContextBuilder]    = None
+        self.df:              Optional[pd.DataFrame]      = None
+        self.history = ConversationHistory(max_tokens=max_history_tokens)
+        self._llm:   Any = None
+
+        key = api_key or os.getenv("ANTHROPIC_API_KEY")
+        if key:
+            try:
+                from src.llm_backend import AnthropicBackend
+                self._llm = AnthropicBackend(api_key=key)
+                log.info("LLM backend ready — hybrid mode active.")
+            except Exception as exc:
+                log.warning(f"LLM backend failed to init ({exc}). Rule-based mode only.")
+        else:
+            log.info("No API key — rule-based mode only.")
+
+    # ── Data loading ───────────────────────────────────────────────────────────
+
+    def load_data(self, filepath: str) -> None:
+        """
+        Load a CSV and initialise all analysis components.
+
+        Resets conversation history — follow-up questions from a previous
+        dataset won't bleed into a new session.
+
+        Args:
+            filepath: Path to the CSV file.
+
+        Raises:
+            FileNotFoundError: If the file does not exist.
+        """
+        path = Path(filepath)
+        if not path.exists():
+            raise FileNotFoundError(f"File not found: {filepath}")
+
+        self.df           = pd.read_csv(filepath)
+        name              = path.stem
+        self.embedder     = DataFrameEmbedder()
+        self.embedder.process_dataframe(self.df, name)
+        self.processor       = QueryProcessor(self.embedder)
+        self.context_builder = ContextBuilder(self.df, dataset_name=name)
+        self.history.clear()
+
+        print(f"✅ Loaded '{name}': {len(self.df):,} rows × {len(self.df.columns)} columns")
+
+    # ── Core query interface ───────────────────────────────────────────────────
+
+    def ask(self, question: str) -> Dict[str, Any]:
+        """
+        Answer a natural-language question about the loaded dataset.
+
+        Routes to the rule-based handler if confidence ≥ threshold.
+        Otherwise calls the LLM with DataFrame context and conversation
+        history. Falls back gracefully if the LLM is unavailable.
+
+        Args:
+            question: Any natural-language question about the data.
+
+        Returns:
+            Dict with keys:
+                answer     — human-readable response string
+                data       — structured data (dict/list) when available
+                type       — answer category identifier
+                source     — "rules" or "llm"
+                confidence — rule-based confidence score (0.0–1.0)
+        """
         if self.processor is None:
-            return {'answer': 'Please load data first', 'type': 'error'}
-            
-        return self.processor.process_query(question)
-        
+            return {
+                "answer": "Please call load_data() first.",
+                "data": None, "type": "error", "source": "rules", "confidence": 1.0,
+            }
+
+        # ── Fast path: rule-based ──────────────────────────────────────────────
+        rule_result = self.processor.process_query(question)
+        if rule_result.get("confidence", 0.0) >= _RULE_CONFIDENCE_THRESHOLD:
+            self.history.add("user",      question)
+            self.history.add("assistant", rule_result["answer"])
+            return {**rule_result, "source": "rules"}
+
+        # ── LLM path ──────────────────────────────────────────────────────────
+        if self._llm is not None:
+            try:
+                context = self.context_builder.build_context(query=question)
+                self.history.add("user", question)
+                reply = self._llm.chat(
+                    messages=self.history.get_messages(),
+                    system_prompt=_SYSTEM_PROMPT,
+                    context=context,
+                )
+                self.history.add("assistant", reply)
+                return {
+                    "answer": reply, "data": None,
+                    "type": "llm_response", "source": "llm",
+                    "confidence": rule_result.get("confidence", 0.0),
+                }
+            except Exception as exc:
+                log.warning(f"LLM call failed: {exc}. Falling back to help message.")
+                # Roll back the user message we already added
+                if self.history.messages and self.history.messages[-1]["role"] == "user":
+                    self.history.messages.pop()
+
+        # ── Fallback: help ────────────────────────────────────────────────────
+        fallback = (
+            "I can answer questions about: column names, row counts, missing values, "
+            "correlations, averages, group aggregations (highest/lowest by category), "
+            "dataset summaries, and visualization suggestions.\n\n"
+            "For open-ended, multi-step, or follow-up questions, "
+            "set ANTHROPIC_API_KEY to enable the LLM path."
+        )
+        self.history.add("user",      question)
+        self.history.add("assistant", fallback)
+        return {"answer": fallback, "data": None, "type": "help", "source": "rules", "confidence": 0.0}
+
+    # ── Insights ───────────────────────────────────────────────────────────────
+
     def generate_insights(self) -> List[str]:
-        '''Automatically generate insights'''
-        insights = []
-        
-        # Missing data
-        missing = self.df.isnull().sum().sum()
-        if missing > 0:
-            insights.append(f"⚠️ Dataset has {missing} missing values across {self.df.isnull().any().sum()} columns")
-            
-        # Correlations
-        numeric_cols = self.df.select_dtypes(include=[np.number]).columns
-        if len(numeric_cols) >= 2:
-            corr = self.df[numeric_cols].corr()
-            high_corr = []
-            for i in range(len(corr.columns)):
-                for j in range(i+1, len(corr.columns)):
-                    if abs(corr.iloc[i, j]) > 0.7:
-                        high_corr.append((corr.columns[i], corr.columns[j], corr.iloc[i, j]))
-                        
-            if high_corr:
-                best = max(high_corr, key=lambda x: abs(x[2]))
-                insights.append(f"🔍 Found {len(high_corr)} strong correlations — strongest: {best[0]} ↔ {best[1]} (r={best[2]:.3f})")
+        """
+        Automatically surface notable patterns in the loaded dataset.
 
-        # Numeric summary
-        for col in numeric_cols:
-            if col == 'date' or 'date' in col.lower():
+        Checks for significant missing data, strong correlations,
+        outlier-heavy columns, and dominant categorical values.
+
+        Returns:
+            List of insight strings prefixed with emoji indicators.
+        """
+        if self.df is None:
+            return []
+
+        insights: List[str] = []
+
+        total_missing = int(self.df.isnull().sum().sum())
+        if total_missing:
+            insights.append(f"⚠️  {total_missing:,} missing values across {int(self.df.isnull().any().sum())} column(s)")
+
+        numeric = self.df.select_dtypes(include=[np.number]).columns
+        if len(numeric) >= 2:
+            corr   = self.df[numeric].corr()
+            strong = [
+                (corr.columns[i], corr.columns[j], corr.iloc[i, j])
+                for i in range(len(corr.columns))
+                for j in range(i + 1, len(corr.columns))
+                if abs(corr.iloc[i, j]) > 0.7
+            ]
+            if strong:
+                best = max(strong, key=lambda x: abs(x[2]))
+                insights.append(
+                    f"🔍 {len(strong)} strong correlation(s) — "
+                    f"strongest: {best[0]} ↔ {best[1]} (r={best[2]:.3f})"
+                )
+
+        for col in numeric:
+            if "date" in col.lower():
                 continue
-            q1 = self.df[col].quantile(0.25)
-            q3 = self.df[col].quantile(0.75)
-            iqr = q3 - q1
-            outliers = ((self.df[col] < (q1 - 1.5 * iqr)) | (self.df[col] > (q3 + 1.5 * iqr))).sum()
-            if outliers > len(self.df) * 0.05:
-                insights.append(f"📊 {col} has {outliers} potential outliers ({outliers/len(self.df):.1%} of rows)")
+            q1, q3 = self.df[col].quantile(0.25), self.df[col].quantile(0.75)
+            iqr    = q3 - q1
+            n_out  = int(((self.df[col] < q1 - 1.5 * iqr) | (self.df[col] > q3 + 1.5 * iqr)).sum())
+            if n_out > len(self.df) * 0.05:
+                insights.append(f"📊 {col}: {n_out:,} potential outliers ({n_out / len(self.df):.1%} of rows)")
 
-        # Categorical summary
-        cat_cols = self.df.select_dtypes(include='object').columns
-        for col in cat_cols:
-            top = self.df[col].value_counts().iloc[0]
-            pct = top / len(self.df) * 100
+        for col in self.df.select_dtypes(include="object").columns:
+            top_count = self.df[col].value_counts().iloc[0]
+            pct       = top_count / len(self.df) * 100
             if pct > 40:
                 insights.append(f"📌 {col}: '{self.df[col].value_counts().index[0]}' dominates ({pct:.1f}% of rows)")
 
         return insights
 
+    # ── Conversation management ────────────────────────────────────────────────
+
+    def get_conversation_history(self) -> List[Dict[str, str]]:
+        """Return a copy of the full conversation message list."""
+        return self.history.get_messages()
+
+    def reset_conversation(self) -> None:
+        """Clear conversation history without reloading data."""
+        self.history.clear()
+
+    def save_conversation(self, path: str) -> None:
+        """Persist conversation history to a JSON file."""
+        self.history.save(path)
+
+    def load_conversation(self, path: str) -> None:
+        """Restore conversation from a JSON file saved by save_conversation()."""
+        self.history = ConversationHistory.load(path)
+
+
+# ── Demo ──────────────────────────────────────────────────────────────────────
 
 def demo():
-    '''Demonstration'''
+    """
+    End-to-end demo of LLMDataAssistant.
+
+    Set ANTHROPIC_API_KEY to see the LLM path handle the open-ended
+    questions at the end. Rule-based questions work without a key.
+    """
     import tempfile
-    
-    # Create sample dataset
+
     np.random.seed(42)
-    data = pd.DataFrame({
-        'date': pd.date_range('2024-01-01', periods=100),
-        'sales': np.random.poisson(100, 100) + np.arange(100) * 0.5,
-        'revenue': np.random.normal(5000, 1000, 100) + np.arange(100) * 10,
-        'region': np.random.choice(['North', 'South', 'East', 'West'], 100),
-        'category': np.random.choice(['A', 'B', 'C'], 100)
+    df = pd.DataFrame({
+        "date":     pd.date_range("2024-01-01", periods=100),
+        "sales":    np.random.poisson(100, 100) + np.arange(100) * 0.5,
+        "revenue":  np.random.normal(5000, 1000, 100) + np.arange(100) * 10,
+        "region":   np.random.choice(["North", "South", "East", "West"], 100),
+        "category": np.random.choice(["A", "B", "C"], 100),
     })
-    
-    # Add some missing values
-    data.loc[np.random.choice(100, 10), 'revenue'] = np.nan
-    
-    # Save temporarily
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as f:
-        data.to_csv(f.name, index=False)
+    df.loc[np.random.choice(100, 10), "revenue"] = np.nan
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
+        df.to_csv(f.name, index=False)
         filepath = f.name
-        
-    print('LLM Data Analysis Assistant Demo')
-    print('=' * 50)
-    
-    # Create assistant
+
+    print("LLM Data Analysis Assistant Demo")
+    print("=" * 55)
+
     assistant = LLMDataAssistant()
     assistant.load_data(filepath)
-    
-    # Ask questions
+
     questions = [
-        "What columns are in the dataset?",
-        "How many rows are there?",
+        "What columns are in this dataset?",
         "Are there any missing values?",
-        "What are the correlations between numeric columns?",
-        "What is the average revenue?",
+        "What are the strongest correlations?",
         "Which region has the highest sales?",
+        "What is the average revenue?",
+        # Open-ended — route to LLM if key is set
+        "What story does the revenue trend tell over the 100 days?",
+        "Based on these patterns, where would you invest next quarter and why?",
     ]
-    
-    print('\n📝 Asking questions:\n')
+
+    print("\n📝 Questions:\n")
     for q in questions:
-        print(f"Q: {q}")
         result = assistant.ask(q)
-        print(f"A: {result['answer']}\n")
-        
-    # Generate insights
-    print('💡 Automatic Insights:')
+        source = "🤖 LLM" if result.get("source") == "llm" else "⚡ Rules"
+        print(f"Q: {q}")
+        print(f"A [{source}]: {result['answer']}\n")
+
+    print("\n💡 Automatic Insights:")
     for insight in assistant.generate_insights():
         print(f"  {insight}")
 
+    print(f"\n📜 {len(assistant.history)} messages in conversation history")
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     demo()
