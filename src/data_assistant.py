@@ -94,15 +94,19 @@ class QueryProcessor:
         '''Process a query and return results'''
         query_lower = query.lower()
         
-        # Route to appropriate handler
-        if 'column' in query_lower or 'field' in query_lower:
-            return self._handle_column_query(query)
-        elif 'row' in query_lower or 'record' in query_lower:
-            return self._handle_row_query(query)
-        elif 'correlat' in query_lower:
+        # Route to appropriate handler — order matters: more specific checks first
+        if 'correlat' in query_lower:
             return self._handle_correlation_query()
         elif 'missing' in query_lower or 'null' in query_lower:
             return self._handle_missing_query()
+        elif 'average' in query_lower or 'mean' in query_lower:
+            return self._handle_average_query(query_lower)
+        elif 'highest' in query_lower or 'which' in query_lower or 'region' in query_lower or 'top' in query_lower:
+            return self._handle_group_query(query_lower)
+        elif 'column' in query_lower or 'field' in query_lower:
+            return self._handle_column_query(query)
+        elif 'row' in query_lower or 'record' in query_lower or 'how many' in query_lower:
+            return self._handle_row_query(query)
         elif 'summary' in query_lower or 'describe' in query_lower:
             return self._handle_summary_query()
         elif 'visuali' in query_lower or 'plot' in query_lower or 'chart' in query_lower:
@@ -151,18 +155,68 @@ class QueryProcessor:
                 
         correlations.sort(key=lambda x: abs(x['correlation']), reverse=True)
         
-        top_corr = correlations[0] if correlations else None
-        if top_corr:
-            answer = (f"Strongest correlation: {top_corr['col1']} and {top_corr['col2']} "
-                     f"(r={top_corr['correlation']:.3f})")
-        else:
-            answer = "No correlations found"
-            
+        top_5 = correlations[:5]
+        lines = [f"  {c['col1']} ↔ {c['col2']}: r={c['correlation']:.3f}" for c in top_5]
+        answer = "Top correlations:\n" + "\n".join(lines)
+
         return {
             'answer': answer,
             'data': correlations[:5],
             'type': 'correlation',
             'visualization': 'heatmap'
+        }
+
+    def _handle_average_query(self, query_lower: str) -> Dict:
+        '''Handle average/mean questions'''
+        numeric_cols = self.df.select_dtypes(include=[np.number]).columns.tolist()
+
+        # Check if query targets a specific column
+        targeted = [col for col in numeric_cols if col.lower() in query_lower or col.replace('_', ' ') in query_lower]
+
+        if targeted:
+            lines = [f"  {col}: {self.df[col].mean():,.2f}" for col in targeted]
+        else:
+            lines = [f"  {col}: {self.df[col].mean():,.2f}" for col in numeric_cols]
+
+        return {
+            'answer': "Average values:\n" + "\n".join(lines),
+            'data': {col: float(self.df[col].mean()) for col in numeric_cols},
+            'type': 'average'
+        }
+
+    def _handle_group_query(self, query_lower: str) -> Dict:
+        '''Handle groupby questions — highest region, top category, etc.'''
+        categorical_cols = self.df.select_dtypes(include='object').columns.tolist()
+        numeric_cols = self.df.select_dtypes(include=[np.number]).columns.tolist()
+
+        if not categorical_cols or not numeric_cols:
+            return {'answer': "No categorical columns available to group by.", 'type': 'group'}
+
+        # Pick group column based on query keywords
+        group_col = categorical_cols[0]
+        for col in categorical_cols:
+            if col.lower() in query_lower:
+                group_col = col
+                break
+
+        # Pick value column based on query keywords
+        value_col = numeric_cols[0]
+        for col in numeric_cols:
+            if col.lower() in query_lower or col.replace('_', ' ') in query_lower:
+                value_col = col
+                break
+        # Default to revenue if present
+        if 'revenue' in numeric_cols and 'revenue' not in query_lower:
+            value_col = 'revenue'
+
+        grouped = self.df.groupby(group_col)[value_col].sum().sort_values(ascending=False)
+        top = grouped.index[0]
+        lines = [f"  {idx}: {val:,.0f}" for idx, val in grouped.items()]
+
+        return {
+            'answer': f"By {group_col}, highest {value_col} is '{top}':\n" + "\n".join(lines),
+            'data': grouped.to_dict(),
+            'type': 'group'
         }
         
     def _handle_missing_query(self) -> Dict:
@@ -225,6 +279,8 @@ class QueryProcessor:
                 "  - Row counts\n"
                 "  - Missing data analysis\n"
                 "  - Correlation analysis\n"
+                "  - Average/mean values\n"
+                "  - Highest/top group analysis\n"
                 "  - Dataset summaries\n"
                 "  - Visualization suggestions"
             ),
@@ -267,7 +323,7 @@ class LLMDataAssistant:
         # Missing data
         missing = self.df.isnull().sum().sum()
         if missing > 0:
-            insights.append(f"⚠️ Dataset has {missing} missing values")
+            insights.append(f"⚠️ Dataset has {missing} missing values across {self.df.isnull().any().sum()} columns")
             
         # Correlations
         numeric_cols = self.df.select_dtypes(include=[np.number]).columns
@@ -280,17 +336,28 @@ class LLMDataAssistant:
                         high_corr.append((corr.columns[i], corr.columns[j], corr.iloc[i, j]))
                         
             if high_corr:
-                insights.append(f"🔍 Found {len(high_corr)} strong correlations")
-                
-        # Outliers
+                best = max(high_corr, key=lambda x: abs(x[2]))
+                insights.append(f"🔍 Found {len(high_corr)} strong correlations — strongest: {best[0]} ↔ {best[1]} (r={best[2]:.3f})")
+
+        # Numeric summary
         for col in numeric_cols:
+            if col == 'date' or 'date' in col.lower():
+                continue
             q1 = self.df[col].quantile(0.25)
             q3 = self.df[col].quantile(0.75)
             iqr = q3 - q1
             outliers = ((self.df[col] < (q1 - 1.5 * iqr)) | (self.df[col] > (q3 + 1.5 * iqr))).sum()
             if outliers > len(self.df) * 0.05:
-                insights.append(f"📊 {col} has {outliers} potential outliers")
-                
+                insights.append(f"📊 {col} has {outliers} potential outliers ({outliers/len(self.df):.1%} of rows)")
+
+        # Categorical summary
+        cat_cols = self.df.select_dtypes(include='object').columns
+        for col in cat_cols:
+            top = self.df[col].value_counts().iloc[0]
+            pct = top / len(self.df) * 100
+            if pct > 40:
+                insights.append(f"📌 {col}: '{self.df[col].value_counts().index[0]}' dominates ({pct:.1f}% of rows)")
+
         return insights
 
 
@@ -328,7 +395,9 @@ def demo():
         "What columns are in the dataset?",
         "How many rows are there?",
         "Are there any missing values?",
-        "Show me correlations",
+        "What are the correlations between numeric columns?",
+        "What is the average revenue?",
+        "Which region has the highest sales?",
     ]
     
     print('\n📝 Asking questions:\n')
