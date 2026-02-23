@@ -42,8 +42,8 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-from src.context_builder import ContextBuilder
-from src.conversation import ConversationHistory
+from context_builder import ContextBuilder
+from conversation import ConversationHistory
 
 log = logging.getLogger(__name__)
 
