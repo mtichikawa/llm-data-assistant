@@ -289,7 +289,7 @@ class LLMDataAssistant:
         key = api_key or os.getenv("ANTHROPIC_API_KEY")
         if key:
             try:
-                from src.llm_backend import AnthropicBackend
+                from llm_backend import AnthropicBackend
                 self._llm = AnthropicBackend(api_key=key)
                 log.info("LLM backend ready — hybrid mode active.")
             except Exception as exc:
