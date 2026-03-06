@@ -178,3 +178,4 @@ class ConversationHistory:
 
     def _token_estimate(self) -> int:
         return sum(len(m["content"]) for m in self.messages) // _CHARS_PER_TOKEN
+# style: minor whitespace pass
