@@ -25,7 +25,7 @@ import pandas as pd
 
 log = logging.getLogger(__name__)
 
-_CHAR_BUDGET = 6_000
+_CHAR_BUDGET = 6_000  # ~1500 tokens; leaves room for conversation history and model response
 _SAMPLE_ROWS = 5
 
 
