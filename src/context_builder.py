@@ -26,7 +26,7 @@ import pandas as pd
 log = logging.getLogger(__name__)
 
 _CHAR_BUDGET = 6_000  # ~1500 tokens; leaves room for conversation history and model response
-_SAMPLE_ROWS = 5
+_SAMPLE_ROWS = 5  # dropped first if context exceeds _CHAR_BUDGET -- least critical for LLM reasoning
 
 
 class ContextBuilder:
