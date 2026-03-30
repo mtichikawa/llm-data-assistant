@@ -99,7 +99,7 @@ class ContextBuilder:
 
         q_tokens = set(re.split(r"[\s_\-,]+", query.lower()))
 
-        def score(col: str) -> int:
+        def score(col: str) -> int:  # 2=exact token match, 1=substring overlap, 0=no match
             col_parts = set(re.split(r"[\s_\-]+", col.lower()))
             if col_parts & q_tokens:
                 return 2
