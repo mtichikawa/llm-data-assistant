@@ -47,7 +47,7 @@ from conversation import ConversationHistory
 
 log = logging.getLogger(__name__)
 
-# Confidence threshold: rule-based results below this are escalated to the LLM
+# Queries at or above this confidence are answered rule-based, with no LLM API call
 _RULE_CONFIDENCE_THRESHOLD = 0.7
 
 _SYSTEM_PROMPT = """\
