@@ -27,7 +27,7 @@ from typing import Any, Dict, List, Optional
 
 log = logging.getLogger(__name__)
 
-_MODEL       = "claude-haiku-4-5-20251001"
+_MODEL       = "claude-haiku-4-5-20251001"  # haiku: lower latency for fast-path escalation; swap for sonnet/opus for complex analysis
 _MAX_RETRIES = 3
 _BASE_DELAY  = 1.0   # seconds
 _MAX_DELAY   = 30.0  # seconds cap
