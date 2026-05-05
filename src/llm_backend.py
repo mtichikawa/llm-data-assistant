@@ -184,5 +184,5 @@ class AnthropicBackend:
 
     @staticmethod
     def _backoff(attempt: int) -> float:
-        import random
+        import random  # lazy -- avoids influencing global random state on module import
         return min(_BASE_DELAY * (2 ** attempt) + random.uniform(0, 1), _MAX_DELAY)
