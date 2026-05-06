@@ -44,6 +44,7 @@ import pandas as pd
 
 from context_builder import ContextBuilder
 from conversation import ConversationHistory
+from model_router import ModelRouter
 
 log = logging.getLogger(__name__)
 
@@ -278,24 +279,37 @@ class LLMDataAssistant:
         self,
         api_key:            Optional[str] = None,
         max_history_tokens: int           = 3000,
+        router:             Optional[ModelRouter] = None,
     ):
         self.embedder:        Optional[DataFrameEmbedder] = None
         self.processor:       Optional[QueryProcessor]    = None
         self.context_builder: Optional[ContextBuilder]    = None
         self.df:              Optional[pd.DataFrame]      = None
-        self.history = ConversationHistory(max_tokens=max_history_tokens)
-        self._llm:   Any = None
+        self.router          = router or ModelRouter()
+        self._llm_default:   Any = None  # Haiku — fast, low-latency lookups
+        self._llm_escalated: Any = None  # Sonnet — multi-step analysis, "why" queries
 
         key = api_key or os.getenv("ANTHROPIC_API_KEY")
         if key:
             try:
                 from llm_backend import AnthropicBackend
-                self._llm = AnthropicBackend(api_key=key)
-                log.info("LLM backend ready — hybrid mode active.")
+                self._llm_default   = AnthropicBackend(api_key=key, model=self.router.default)
+                self._llm_escalated = AnthropicBackend(api_key=key, model=self.router.escalated)
+                log.info(
+                    f"LLM backends ready — default={self.router.default}, "
+                    f"escalated={self.router.escalated}."
+                )
             except Exception as exc:
                 log.warning(f"LLM backend failed to init ({exc}). Rule-based mode only.")
         else:
             log.info("No API key — rule-based mode only.")
+
+        # Conversation history with a summarizer wired to the cheap backend, so
+        # dropped messages get compressed into a residue rather than evaporating.
+        self.history = ConversationHistory(
+            max_tokens = max_history_tokens,
+            summarizer = self._summarize_dropped if self._llm_default is not None else None,
+        )
 
     # ── Data loading ───────────────────────────────────────────────────────────
 
@@ -361,11 +375,17 @@ class LLMDataAssistant:
             return {**rule_result, "source": "rules"}
 
         # ── LLM path ──────────────────────────────────────────────────────────
-        if self._llm is not None:
+        if self._llm_default is not None:
             try:
                 context = self.context_builder.build_context(query=question)
                 self.history.add("user", question)
-                reply = self._llm.chat(
+
+                # Smart routing: escalate to Sonnet on complexity keywords,
+                # deep histories (3+ turns), or long queries.
+                model = self.router.select(question, history_turns=self.history.turn_count - 1)
+                backend = self._llm_escalated if model == self.router.escalated else self._llm_default
+
+                reply = backend.chat(
                     messages=self.history.get_messages(),
                     system_prompt=_SYSTEM_PROMPT,
                     context=context,
@@ -374,6 +394,7 @@ class LLMDataAssistant:
                 return {
                     "answer": reply, "data": None,
                     "type": "llm_response", "source": "llm",
+                    "model": model,
                     "confidence": rule_result.get("confidence", 0.0),
                 }
             except Exception as exc:
@@ -465,6 +486,35 @@ class LLMDataAssistant:
     def load_conversation(self, path: str) -> None:
         """Restore conversation from a JSON file saved by save_conversation()."""
         self.history = ConversationHistory.load(path)
+
+    # ── Summarization for ConversationHistory ──────────────────────────────────
+
+    def _summarize_dropped(self, dropped: List[Dict[str, str]]) -> str:
+        """
+        Compress dropped messages into a 1-2 sentence summary using the
+        cheap default backend. Preserves entities, numbers, and column
+        names so follow-up questions can still resolve references.
+
+        Returns the summary string. The caller (ConversationHistory)
+        wraps it as a synthetic ``[Earlier in this conversation: ...]``
+        turn and inserts it in place of the dropped messages.
+        """
+        if self._llm_default is None or not dropped:
+            return ""
+        excerpt = "\n".join(f"{m['role']}: {m['content']}" for m in dropped)
+        prompt = (
+            "Summarize the following conversation excerpt in 1-2 sentences. "
+            "Preserve any specific entities, numbers, or column names mentioned.\n\n"
+            f"Excerpt:\n{excerpt}"
+        )
+        try:
+            return self._llm_default.chat(
+                messages=[{"role": "user", "content": prompt}],
+                system_prompt="You compress conversations losslessly for entity references.",
+            ).strip()
+        except Exception as exc:
+            log.warning(f"Summarization call failed ({exc}). Falling back to trim-oldest.")
+            return ""
 
 
 # ── Demo ──────────────────────────────────────────────────────────────────────
