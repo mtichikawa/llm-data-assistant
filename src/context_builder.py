@@ -82,7 +82,7 @@ class ContextBuilder:
 
         full = "\n".join(lines)
 
-        # If over budget, drop sample rows (least critical for reasoning)
+        # Sample rows are dropped first: column stats carry more signal for LLM reasoning
         if len(full) > _CHAR_BUDGET:
             idx   = lines.index(sample_header)
             full  = "\n".join(lines[:idx])
