@@ -29,11 +29,12 @@ import logging
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 log = logging.getLogger(__name__)
 
 _CHARS_PER_TOKEN = 4   # rough approximation
+_RESIDUE_PREFIX  = "[Earlier in this conversation: "
 
 
 class ConversationHistory:
@@ -51,15 +52,28 @@ class ConversationHistory:
                     those are accounted for separately. Default 3000.
         session_id: Optional string identifier for logging and persistence.
                     Auto-generated from current UTC time if not provided.
+        summarizer: Optional callable that compresses a list of dropped
+                    messages into a single summary string. When provided,
+                    over-budget trims replace the dropped messages with a
+                    synthetic ``[Earlier in this conversation: ...]`` turn
+                    so entity references (column names, numbers, regions)
+                    survive the compression. Default None preserves the
+                    older trim-oldest behaviour.
 
     Attributes:
         messages:    List of {"role": str, "content": str} message dicts.
         turn_count:  Cumulative number of add() calls (never decremented).
     """
 
-    def __init__(self, max_tokens: int = 3000, session_id: Optional[str] = None):
+    def __init__(
+        self,
+        max_tokens: int = 3000,
+        session_id: Optional[str] = None,
+        summarizer: Optional[Callable[[List[Dict[str, str]]], str]] = None,
+    ):
         self.max_tokens  = max_tokens
         self.session_id  = session_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        self.summarizer  = summarizer
         self.messages:   List[Dict[str, str]] = []
         self.turn_count: int = 0
 
@@ -82,12 +96,69 @@ class ConversationHistory:
         self.messages.append({"role": role, "content": content})
         self.turn_count += 1
 
-        # Trim oldest messages to stay within budget, always keeping ≥2 messages
+        if self._token_estimate() <= self.max_tokens:
+            return
+
+        if self.summarizer is None:
+            # Trim oldest messages to stay within budget, always keeping ≥2 messages
+            while self._token_estimate() > self.max_tokens and len(self.messages) > 2:
+                dropped = self.messages.pop(0)
+                log.debug(
+                    f"[{self.session_id}] Trimmed oldest message "
+                    f"({len(dropped['content'])} chars) to stay within {self.max_tokens}-token budget."
+                )
+            return
+
+        self._compress_oldest()
+
+    def _compress_oldest(self) -> None:
+        """
+        Pull dropped messages off the front, compress them via summarizer,
+        and replace them with a single synthetic residue turn. If the
+        summarizer returns empty (e.g. API failed), fall back to trim-oldest.
+        """
+        dropped: List[Dict[str, str]] = []
+        existing_residue_index: Optional[int] = None
+        existing_residue: Optional[str] = None
+
+        # If the front of history is already a residue from a prior compression,
+        # pull it forward so we re-summarize cumulatively rather than stack
+        # nested "[Earlier in this conversation: ...]" turns.
+        if self.messages and self.messages[0]["content"].startswith(_RESIDUE_PREFIX):
+            existing_residue_index = 0
+            existing_residue = self.messages[0]["content"][len(_RESIDUE_PREFIX):].rstrip("]").strip()
+
         while self._token_estimate() > self.max_tokens and len(self.messages) > 2:
-            dropped = self.messages.pop(0)
+            idx = 0
+            if existing_residue_index is not None and len(self.messages) > 1:
+                idx = 1  # skip the residue we already have queued for re-summarization
+            dropped.append(self.messages.pop(idx))
+
+        if existing_residue is not None:
+            # Re-summarize residue + new dropped messages together.
+            self.messages.pop(existing_residue_index)
+            dropped.insert(0, {"role": "user", "content": existing_residue})
+
+        try:
+            summary = self.summarizer(dropped) if dropped else ""
+        except Exception as exc:
+            log.warning(f"[{self.session_id}] Summarizer raised ({exc}); residue suppressed.")
+            summary = ""
+
+        if summary:
+            residue = {
+                "role": "user",
+                "content": f"{_RESIDUE_PREFIX}{summary}]",
+            }
+            self.messages.insert(0, residue)
             log.debug(
-                f"[{self.session_id}] Trimmed oldest message "
-                f"({len(dropped['content'])} chars) to stay within {self.max_tokens}-token budget."
+                f"[{self.session_id}] Compressed {len(dropped)} dropped message(s) "
+                f"into a residue of {len(summary)} chars."
+            )
+        else:
+            log.debug(
+                f"[{self.session_id}] Summarizer returned empty; "
+                f"dropped {len(dropped)} message(s) without residue."
             )
 
     def clear(self) -> None:
@@ -178,4 +249,3 @@ class ConversationHistory:
 
     def _token_estimate(self) -> int:
         return sum(len(m["content"]) for m in self.messages) // _CHARS_PER_TOKEN
-# style: minor whitespace pass
