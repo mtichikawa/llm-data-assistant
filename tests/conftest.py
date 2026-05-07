@@ -1,6 +1,6 @@
 """Make ``src/`` importable from the tests directory."""
-import sys
 from pathlib import Path
+import sys
 
 SRC_DIR = Path(__file__).resolve().parent.parent / "src"
 if str(SRC_DIR) not in sys.path:
