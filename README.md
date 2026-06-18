@@ -141,3 +141,5 @@ Contact: Mike Ichikawa - projects.ichikawa@gmail.com
 # 2025-12-24
 # 2025-12-28
 # 2026-01-03
+
+> _Note: the fast-path / LLM-path routing threshold defaults to 0.7. Lower it to send more queries to the deterministic fast path (saves API cost, risks lower-quality answers on edge cases); raise it to fall back to the LLM more aggressively._
