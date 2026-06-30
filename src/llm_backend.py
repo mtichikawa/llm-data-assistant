@@ -19,11 +19,11 @@ Usage:
     )
 """
 
+from typing import Any, Dict, List, Optional
 import json
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional
 
 log = logging.getLogger(__name__)
 
