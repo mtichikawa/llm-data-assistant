@@ -24,12 +24,12 @@ Usage:
     restored = ConversationHistory.load("sessions/2025-11-05.json")
 """
 
-import json
-import logging
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
+import json
+import logging
 
 log = logging.getLogger(__name__)
 
