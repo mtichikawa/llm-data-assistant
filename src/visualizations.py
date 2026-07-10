@@ -3,12 +3,12 @@ Visualization Generator
 Automatically create charts and plots for data analysis
 '''
 
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
 from pathlib import Path
 from typing import Dict, List
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
 
 
 class VisualizationGenerator:
@@ -226,4 +226,3 @@ def demo():
 
 if __name__ == '__main__':
     demo()
-# todo: add integration test coverage
