@@ -1,5 +1,6 @@
 """Smoke tests for LLMDataAssistant — no API key needed (rule-based path only)."""
 
+from typing import Any
 import os
 import tempfile
 
@@ -10,7 +11,7 @@ from data_assistant import LLMDataAssistant
 
 
 @pytest.fixture
-def assistant_no_key(monkeypatch):
+def assistant_no_key(monkeypatch: Any):
     """Construct an assistant explicitly without an API key."""
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     return LLMDataAssistant(api_key=None)
