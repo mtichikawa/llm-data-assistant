@@ -65,7 +65,7 @@ cd examples && python quick_start.py
 
 The script adds `../src` to the import path and writes its sample CSV to
 `../data/`, so run it from `examples/`. The LLM path needs the `anthropic`
-package (`pip install anthropic`, not in `requirements.txt`) and
+package (in `requirements.txt`) and
 `ANTHROPIC_API_KEY`. Without them, every question uses the rule-based path.
 
 ## Usage
