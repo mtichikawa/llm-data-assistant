@@ -59,14 +59,11 @@ unchanged - it's purely additive.
 
 ```bash
 pip install -r requirements.txt
-mkdir -p data
-cd examples && python quick_start.py
+python examples/quick_start.py
 ```
 
-The script adds `../src` to the import path and writes its sample CSV to
-`../data/`, so run it from `examples/`. The LLM path needs the `anthropic`
-package (in `requirements.txt`) and
-`ANTHROPIC_API_KEY`. Without them, every question uses the rule-based path.
+The script writes its sample CSV to `data/sample.csv`. The LLM path needs the
+`anthropic` package (in `requirements.txt`) and `ANTHROPIC_API_KEY`. Without them, every question uses the rule-based path.
 
 ## Usage
 
