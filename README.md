@@ -1,6 +1,6 @@
 # LLM-Powered Data Analysis Assistant
 
-Upload CSV files and ask questions in natural language. Get automatic insights and visualizations.
+A Python library: load a CSV into `LLMDataAssistant` and ask questions about it in natural language. It also generates basic insights and charts. There is no upload UI.
 
 ## Features
 
@@ -26,12 +26,15 @@ Upload CSV files and ask questions in natural language. Get automatic insights a
 
 ### Smart model routing
 
-`ModelRouter` picks between Haiku 4.5 and Sonnet 4.6 per query at zero
-per-call cost. Default is Haiku. Escalates to Sonnet when:
+`ModelRouter` picks between Haiku 4.5 and Sonnet 4.6 for each query that
+reaches the LLM path. The routing decision is rule-based and free; the
+model call it routes to is a billed API call. Default is Haiku. Escalates
+to Sonnet when:
 
 - the query contains a complexity keyword (`why`, `compare`, `explain`,
   `interpret`, `recommend`, `forecast`, `outlier`, `root cause`, ...)
-- the conversation history has 3 or more turns (likely deep analysis)
+- the conversation already holds 3 or more messages (each question and
+  each answer counts as one), so from the third question on
 - the query is over 200 chars (likely complex)
 
 The router is a constructor parameter on `LLMDataAssistant`, so callers
@@ -56,13 +59,21 @@ unchanged - it's purely additive.
 
 ```bash
 pip install -r requirements.txt
-python examples/quick_start.py
+mkdir -p data
+cd examples && python quick_start.py
 ```
+
+The script adds `../src` to the import path and writes its sample CSV to
+`../data/`, so run it from `examples/`. The LLM path needs the `anthropic`
+package (`pip install anthropic`, not in `requirements.txt`) and
+`ANTHROPIC_API_KEY`. Without them, every question uses the rule-based path.
 
 ## Usage
 
+The modules in `src/` import each other by bare name, so put `src/` on the path (for example `PYTHONPATH=src`).
+
 ```python
-from src.data_assistant import LLMDataAssistant
+from data_assistant import LLMDataAssistant
 
 assistant = LLMDataAssistant()
 assistant.load_data('your_data.csv')
@@ -75,7 +86,7 @@ print(result['answer'])
 insights = assistant.generate_insights()
 
 # Create visualizations
-from src.visualizations import VisualizationGenerator
+from visualizations import VisualizationGenerator
 viz = VisualizationGenerator(assistant.df)
 plots = viz.generate_all()
 ```
@@ -86,18 +97,18 @@ plots = viz.generate_all()
 assistant = LLMDataAssistant(api_key=os.getenv("ANTHROPIC_API_KEY"))
 assistant.load_data("q3_sales.csv")
 
-r1 = assistant.ask("What columns are here?")          # → Haiku (factual lookup)
+r1 = assistant.ask("What columns are here?")          # → rules path (free)
 r2 = assistant.ask("Average revenue?")                # → rules path (free)
 r3 = assistant.ask("Why did revenue dip in week 6?")  # → Sonnet ('why' keyword)
 r4 = assistant.ask("Compare to Q2")                   # → Sonnet ('compare' keyword)
-r5 = assistant.ask("Anything else?")                  # → Sonnet (4 prior turns)
+r5 = assistant.ask("Anything else?")                  # → Sonnet (8 prior messages)
 
 # r3..r5 each return result["model"] so you can see which tier ran
 ```
 
 ## Jupyter Notebook
 
-See `notebooks/complete_demo.ipynb` for full demonstration.
+See `notebooks/llm_data_assistant_analysis.ipynb` for a full demonstration.
 
 ## What's Inside
 
@@ -107,39 +118,16 @@ See `notebooks/complete_demo.ipynb` for full demonstration.
 - `src/llm_backend.py` - Anthropic API wrapper with retry + JSON mode
 - `src/context_builder.py` - DataFrame summary assembly for the system prompt
 - `src/visualizations.py` - Auto-visualization
-- `notebooks/complete_demo.ipynb` - Full workflow
+- `notebooks/llm_data_assistant_analysis.ipynb` - Full workflow
 - `examples/quick_start.py` - 5-minute demo
 - `tests/` - 14 tests covering ModelRouter, ConversationHistory, smoke path
 
 ## What I Learned
 
-- Building RAG systems for structured data
+- Building LLM context from a DataFrame summary, plus rule-based routing
 - Natural language to data queries
 - Automatic insight generation
-- Production-ready data analysis tools
 
 Contact: Mike Ichikawa - projects.ichikawa@gmail.com
-
-# 2025-10-05
-# 2025-10-05
-# 2025-10-09
-# 2025-10-14
-# 2025-10-18
-# 2025-10-23
-# 2025-10-28
-# 2025-11-02
-# 2025-11-07
-# 2025-11-11
-# 2025-11-16
-# 2025-11-21
-# 2025-11-26
-# 2025-12-01
-# 2025-12-05
-# 2025-12-10
-# 2025-12-15
-# 2025-12-20
-# 2025-12-24
-# 2025-12-28
-# 2026-01-03
 
 > _Note: the fast-path / LLM-path routing threshold defaults to 0.7. Lower it to send more queries to the deterministic fast path (saves API cost, risks lower-quality answers on edge cases); raise it to fall back to the LLM more aggressively._
